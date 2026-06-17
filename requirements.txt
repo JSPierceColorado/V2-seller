@@ -1,0 +1,5 @@
+fastapi
+uvicorn[standard]
+alpaca-py
+gspread
+google-auth
