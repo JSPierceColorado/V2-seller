@@ -1,5 +1,4 @@
-fastapi
-uvicorn[standard]
-alpaca-py
-gspread
-google-auth
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+alpaca-py==0.35.0
+gspread==6.1.4
