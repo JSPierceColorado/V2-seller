@@ -5,17 +5,17 @@ import logging
 import os
 import time
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation, ROUND_DOWN
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import gspread
 from fastapi import FastAPI
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockLatestQuoteRequest
 from alpaca.trading.client import TradingClient
-from alpaca.trading.enums import OrderSide, OrderType, QueryOrderStatus, TimeInForce
-from alpaca.trading.requests import GetOrdersRequest, LimitOrderRequest, MarketOrderRequest
+from alpaca.trading.enums import OrderSide, OrderType, TimeInForce
+from alpaca.trading.requests import LimitOrderRequest, MarketOrderRequest
 
 
 # Seller tab visible columns.
@@ -29,8 +29,8 @@ HEADERS = [
     "action",
 ]
 
-# Action states that prevent repeat sell submissions while Alpaca still shows the position.
-PROTECTIVE_LAST_ACTIONS = {"SELL_SUBMITTED", "SELL_PROTECTED"}
+# A submitted full-position sell remains final while Alpaca still shows the position.
+PROTECTIVE_LAST_ACTIONS = {"SELL_SUBMITTED"}
 
 TERMINAL_ORDER_STATUSES = {
     "filled",
@@ -69,7 +69,6 @@ class Config:
     sell_extended_time_in_force: str
     order_poll_interval_seconds: int
 
-    sell_order_lookback_minutes: int
     poll_seconds: int
     error_backoff_seconds: int
     bot_auto_start: bool
@@ -126,7 +125,6 @@ def load_config() -> Config:
         sell_extended_time_in_force=os.getenv("SELL_EXTENDED_TIME_IN_FORCE", "day").strip().lower() or "day",
         order_poll_interval_seconds=env_int("ORDER_POLL_INTERVAL_SECONDS", 1),
 
-        sell_order_lookback_minutes=env_int("SELL_ORDER_LOOKBACK_MINUTES", 60),
         poll_seconds=env_int("POLL_SECONDS", 10),
         error_backoff_seconds=env_int("ERROR_BACKOFF_SECONDS", 90),
         bot_auto_start=env_bool("BOT_AUTO_START", True),
@@ -345,33 +343,6 @@ def write_seller_rows(worksheet: Any, rows: List[List[Any]]) -> None:
         values=padded_payload,
         value_input_option="USER_ENTERED",
     )
-
-
-def get_recent_sell_order_symbols(
-    trading_client: TradingClient,
-    lookback_minutes: int,
-) -> Set[str]:
-    after = datetime.now(timezone.utc) - timedelta(minutes=lookback_minutes)
-
-    request = GetOrdersRequest(
-        status=QueryOrderStatus.ALL,
-        side=OrderSide.SELL,
-        after=after,
-        limit=500,
-    )
-
-    orders = trading_client.get_orders(filter=request)
-    symbols: Set[str] = set()
-
-    for order in orders:
-        status = safe_order_status(order)
-        if status in TERMINAL_ORDER_STATUSES:
-            continue
-        symbol = str(field(order, "symbol", "")).strip().upper()
-        if symbol:
-            symbols.add(symbol)
-
-    return symbols
 
 
 def market_is_open(trading_client: TradingClient) -> Tuple[bool, str]:
@@ -625,18 +596,6 @@ def run_cycle(
     positions = trading_client.get_all_positions()
     market_open, market_reason = market_is_open(trading_client)
 
-    order_lookup_note = ""
-    protected_sell_symbols: Set[str] = set()
-    try:
-        protected_sell_symbols = get_recent_sell_order_symbols(
-            trading_client,
-            config.sell_order_lookback_minutes,
-        )
-    except Exception as exc:
-        # Do not block a trailing sell just because order lookup failed.
-        order_lookup_note = f"Order lookup failed; continuing without lookup protection: {exc}"
-        logging.warning(order_lookup_note)
-
     rows: List[List[Any]] = []
     submitted_sells: List[Dict[str, str]] = []
     dry_run_signals: List[str] = []
@@ -692,7 +651,6 @@ def run_cycle(
         is_long_position = "long" in side_text or side_text == ""
 
         has_protective_prior_action = last_action in PROTECTIVE_LAST_ACTIONS
-        has_recent_sell_order = symbol in protected_sell_symbols
 
         if market_value is not None and market_value < config.sell_min_market_value:
             sell_signal = False
@@ -708,9 +666,6 @@ def run_cycle(
                 blocked_signals.append({"symbol": symbol, "reason": "qty missing or <= 0"})
             elif has_protective_prior_action:
                 blocked_signals.append({"symbol": symbol, "reason": "prior protective action"})
-            elif has_recent_sell_order:
-                last_action = "SELL_PROTECTED"
-                blocked_signals.append({"symbol": symbol, "reason": "open/recent sell order"})
             elif config.sell_dry_run:
                 last_action = "DRY_RUN_SELL_SIGNAL"
                 dry_run_signals.append(symbol)
@@ -773,8 +728,6 @@ def run_cycle(
         "extended_hours_enabled": config.sell_extended_hours,
         "extended_step_pct": str(config.sell_extended_step_pct),
         "extended_step_seconds": str(config.sell_extended_step_seconds),
-        "protected_sell_symbols": sorted(protected_sell_symbols),
-        "order_lookup_note": order_lookup_note,
         "submitted_sells": submitted_sells,
         "dry_run_signals": dry_run_signals,
         "blocked_signals": blocked_signals,
